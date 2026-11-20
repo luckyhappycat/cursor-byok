@@ -94,6 +94,115 @@ fn captured_kv_ack_hex_decodes_as_agent_client_message() {
     ));
 }
 
+#[test]
+fn bidi_append_decodes_binary_and_hex_agent_messages() {
+    let payload = hex::decode("1a0408011a00").unwrap();
+    for binary in [true, false] {
+        let request = ai::BidiAppendRequest {
+            request_id: Some(ai::BidiRequestId {
+                request_id: "payload-request".into(),
+            }),
+            append_seqno: 7,
+            data_binary: if binary { payload.clone() } else { Vec::new() },
+            data: if binary {
+                String::new()
+            } else {
+                hex::encode(&payload)
+            },
+        };
+        let decoded = cursor::bidi::decode(&request).unwrap();
+        assert_eq!(decoded.request_id, "payload-request");
+        assert_eq!(decoded.seqno, 7);
+        assert_eq!(decoded.message.encode_to_vec(), payload);
+    }
+}
+
+#[test]
+fn bidi_append_uses_binary_payload_when_both_fields_are_present() {
+    let payload = hex::decode("1a0408011a00").unwrap();
+    let request = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "binary-request".into(),
+        }),
+        data: "invalid hex".into(),
+        data_binary: payload.clone(),
+        ..Default::default()
+    };
+    let decoded = cursor::bidi::decode(&request).unwrap();
+    assert_eq!(decoded.message.encode_to_vec(), payload);
+}
+
+#[test]
+fn bidi_append_rejects_malformed_binary_payload() {
+    let request = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "malformed-request".into(),
+        }),
+        data_binary: vec![0xff],
+        ..Default::default()
+    };
+    let error = cursor::bidi::decode(&request).err().unwrap();
+    assert!(error.to_string().contains("protobuf decode error"));
+}
+
+#[tokio::test]
+async fn binary_bidi_append_accepts_plain_and_gzip_http_requests() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(fake_provider::FakeProvider::default()),
+        PromptCompiler::new(PromptAssets::embedded().unwrap()),
+    );
+    let router = cursor::router(registry.clone(), clients).unwrap();
+    for gzip in [false, true] {
+        let request_id = format!("binary-http-{gzip}");
+        let handle = registry.get_or_create(&request_id).await.unwrap();
+        let mut output = handle.subscribe();
+        let wire = ai::BidiAppendRequest {
+            request_id: Some(ai::BidiRequestId { request_id }),
+            data_binary: pb::AgentClientMessage {
+                message: Some(pb::agent_client_message::Message::ClientHeartbeat(
+                    pb::ClientHeartbeat {},
+                )),
+            }
+            .encode_to_vec(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut request = Request::post("/aiserver.v1.BidiService/BidiAppend")
+            .header(header::CONTENT_TYPE, "application/proto");
+        let body = if gzip {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&wire).unwrap();
+            request = request.header(header::CONTENT_ENCODING, "gzip");
+            encoder.finish().unwrap()
+        } else {
+            wire
+        };
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message: pb::AgentServerMessage = fake_cursor::decode_single(&frame).unwrap();
+        let Some(pb::agent_server_message::Message::InteractionUpdate(update)) = message.message
+        else {
+            panic!("expected interaction update")
+        };
+        assert!(matches!(
+            update.message,
+            Some(pb::interaction_update::Message::Heartbeat(_))
+        ));
+    }
+    registry.shutdown().await;
+}
+
 #[tokio::test]
 async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     let (_directory, store) = fixtures::temp_store().await;
